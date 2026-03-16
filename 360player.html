@@ -175,13 +175,55 @@
      ?host=https://…       → override base host (default: current origin)
      ?yaw=0                → initial yaw offset in degrees (default: 0 or localStorage)
      ?nudge=15             → degrees per nudge button press (default: 15)
+      ?reconnectMs=350      → fixed reconnect delay ms (default: 350)
+      ?iceWait=800          → max ICE gather wait before POST (default: 800)
+      ?stallMs=1200         → frozen-frame timeout before recovery (default: 1200)
+      ?maxBufferSec=1.2     → if buffer lead exceeds this, force low-latency reconnect
+      ?dz=0.20              → gamepad deadzone
+      ?ls=0.035             → left-stick look speed (rad/frame)
+      ?ys=0.35              → right-stick yaw speed (deg/frame)
+      ?ts=0.021             → right-stick vertical trim speed (rad/frame)
+      ?ap=60                → max assist pitch in degrees
+
+     Short aliases for QR links:
+     ?s=...   stream
+     ?w=...   whep
+     ?h=...   host
+     ?y=...   yaw
+     ?n=...   nudge
+     ?r=...   reconnectMs
+     ?i=...   iceWait
+     ?st=...  stallMs
+     ?b=...   maxBufferSec
+      ?dz=...  deadzone
+      ?ls=...  look speed
+      ?ys=...  yaw speed
+      ?ts=...  trim speed
+      ?ap=...  assist pitch max
   ───────────────────────────────────────────── */
   const params     = new URLSearchParams(location.search);
-  const streamName = params.get('stream') || 'live';
-  const baseHost   = (params.get('host') || location.origin).replace(/\/$/, '');
-  const whepUrl    = params.get('whep')  || `${baseHost}/${streamName}/whep`;
-  const nudgeDeg   = parseFloat(params.get('nudge') || '15');
-  const initialYaw = parseFloat(params.get('yaw')   || '0');
+  const qp = (longName, shortName, fallback) =>
+    params.get(longName) ?? params.get(shortName) ?? fallback;
+
+  const streamName = qp('stream', 's', 'live');
+  const baseHost   = qp('host', 'h', location.origin).replace(/\/$/, '');
+  const whepUrl    = qp('whep', 'w', '') || `${baseHost}/${streamName}/whep`;
+  const nudgeDeg   = parseFloat(qp('nudge', 'n', '15'));
+  const initialYaw = parseFloat(qp('yaw', 'y', '0'));
+    const reconnectMs = Math.max(
+     100,
+    parseInt(qp('reconnectMs', 'r', params.get('reconnectMin') || '350'), 10)
+    );
+  const iceWaitMs    = Math.max(200, parseInt(qp('iceWait', 'i', '800'), 10));
+  const stallMs      = Math.max(300, parseInt(qp('stallMs', 'st', '1200'), 10));
+  const maxBufferSec = Math.max(0.25, parseFloat(qp('maxBufferSec', 'b', '1.2')));
+    const gamepadDeadzone = Math.max(0.05, Math.min(0.45, parseFloat(qp('deadzone', 'dz', '0.20'))));
+    const gamepadLookSpeed = Math.max(0.005, parseFloat(qp('lookSpeed', 'ls', '0.035')));
+    const gamepadYawSpeed = Math.max(0.05, parseFloat(qp('yawSpeed', 'ys', '0.35')));
+    const gamepadTrimSpeed = Math.max(0.003, parseFloat(qp('trimSpeed', 'ts', '0.021')));
+    const assistPitchMax = THREE.MathUtils.degToRad(
+      Math.max(15, Math.min(89, parseFloat(qp('assistPitchMax', 'ap', '60'))))
+    );
 
   const LS_KEY = `360player_yaw_${streamName}`;
   let yawOffset = parseFloat(localStorage.getItem(LS_KEY) ?? initialYaw);
@@ -208,6 +250,7 @@
   sphereGeo.scale(-1, 1, 1);
 
   const video        = document.getElementById('video');
+  video.setAttribute('disableRemotePlayback', 'true');
   const videoTexture = new THREE.VideoTexture(video);
   try { videoTexture.colorSpace = THREE.SRGBColorSpace; } catch (_) {}
 
@@ -255,12 +298,18 @@
     if (e.key === 'ArrowLeft'  || e.key === 'a' || e.key === 'A') nudgeLeft();
     if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') nudgeRight();
     if (e.key === ' ' || e.key === 'c' || e.key === 'C') { e.preventDefault(); centerYaw(); }
+    if (e.key === 'r' || e.key === 'R') resetAssistOffset();
   });
 
   /* ─────────────────────────────────────────────
      Camera orientation — device + mouse/touch
   ───────────────────────────────────────────── */
   let devOrientActive = false;
+  let assistYaw = 0;
+  let assistPitch = 0;
+  const assistBaseQ = new THREE.Quaternion();
+  const assistOffsetQ = new THREE.Quaternion();
+  const assistEuler = new THREE.Euler();
 
   /* Classic Three.js device-orientation quaternion math */
   const _zee   = new THREE.Vector3(0, 0, 1);
@@ -280,6 +329,7 @@
     const q = new THREE.Quaternion().setFromEuler(_euler);
     q.multiply(_q1);
     q.multiply(new THREE.Quaternion().setFromAxisAngle(_zee, -orient));
+    assistBaseQ.copy(q);
     camera.quaternion.copy(q);
   }
   window.addEventListener('deviceorientation', onDeviceOrientation);
@@ -312,13 +362,40 @@
 
   /* ─────────────────────────────────────────────
      Gamepad / controller support
-     Left stick X → continuous yaw
-     Right stick X → continuous yaw
+     Left stick X/Y → camera look (yaw/pitch)
+      Right stick X  → sphere yaw offset (staff alignment)
+      Right stick Y  → vertical focus trim (assist pitch)
      Button 0 (A/Cross)   → center
      Button 2 (X/Square)  → nudge left
      Button 1 (B/Circle)  → nudge right
+     Button 3 (Y/Triangle)→ reset assistive view offset
   ───────────────────────────────────────────── */
   const gpState = {};  // track button state for edge detection
+
+  function stickAxis(raw) {
+    if (Math.abs(raw) <= gamepadDeadzone) return 0;
+    const norm = (Math.abs(raw) - gamepadDeadzone) / (1 - gamepadDeadzone);
+    const curved = Math.pow(norm, 1.6); // more precision around center
+    return Math.sign(raw) * curved;
+  }
+
+  function resetAssistOffset() {
+    assistYaw = 0;
+    assistPitch = 0;
+  }
+
+  function applyManualLookDelta(dx, dy) {
+    if (devOrientActive) {
+      assistYaw += dx;
+      assistPitch += dy;
+      assistPitch = Math.max(-assistPitchMax, Math.min(assistPitchMax, assistPitch));
+      return;
+    }
+    camYaw += dx;
+    camPitch += dy;
+    camPitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, camPitch));
+    camera.rotation.set(camPitch, camYaw, 0, 'YXZ');
+  }
 
   function pollGamepad() {
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
@@ -327,13 +404,27 @@
       if (!pad) continue;
       if (!gpState[i]) gpState[i] = {};
 
-      /* Stick axes — threshold 0.2 */
-      const axisL = pad.axes[0] || 0;
-      const axisR = pad.axes[2] || 0;
-      const stick = Math.abs(axisL) > 0.2 ? axisL : (Math.abs(axisR) > 0.2 ? axisR : 0);
-      if (stick !== 0) {
-        yawOffset += stick * 0.4;
-        saveYaw(); applyYaw();
+      /* Left stick controls camera look direction (when not using device orientation). */
+      const lx = pad.axes[0] || 0;
+      const ly = pad.axes[1] || 0;
+      const lookX = stickAxis(lx);
+      const lookY = stickAxis(ly);
+      if (lookX !== 0 || lookY !== 0) {
+        applyManualLookDelta(-lookX * gamepadLookSpeed, -lookY * gamepadLookSpeed);
+      }
+
+      /* Right stick controls sphere yaw and vertical focus trim. */
+      const rx = pad.axes[2] || 0;
+      const ry = pad.axes[3] || 0;
+      const yawAxis = stickAxis(rx);
+      const trimY = stickAxis(ry);
+      if (yawAxis !== 0) {
+        yawOffset += yawAxis * gamepadYawSpeed;
+        saveYaw();
+        applyYaw();
+      }
+      if (trimY !== 0) {
+        applyManualLookDelta(0, -trimY * gamepadTrimSpeed);
       }
 
       /* Edge-triggered buttons */
@@ -345,6 +436,7 @@
       btn(0, centerYaw);
       btn(2, nudgeLeft);
       btn(1, nudgeRight);
+      btn(3, resetAssistOffset);
     }
   }
 
@@ -380,75 +472,104 @@
      WHEP client
   ───────────────────────────────────────────── */
   let pc               = null;
-  let reconnectDelay   = 2000;
+  let mediaStream      = null;
   let reconnectTimer   = null;
   let started          = false;
+  let connectInFlight  = false;
+  let lastVideoTime    = 0;
+  let stalledForMs     = 0;
+  let nextStallCheckAt = 0;
 
-  function scheduleReconnect() {
+  function clearVideoSink() {
+    if (mediaStream) {
+      try { mediaStream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+    }
+    mediaStream = null;
+    try { video.pause(); } catch (_) {}
+    video.srcObject = null;
+  }
+
+  function scheduleReconnect(reason) {
     clearTimeout(reconnectTimer);
+    const delay = reconnectMs;
+    setStatus('connecting', `Reconnecting in ${delay} ms…`);
     reconnectTimer = setTimeout(() => {
-      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      if (reason) console.warn('Reconnect:', reason);
       connectWHEP();
-    }, reconnectDelay);
+    }, delay);
   }
 
   function closePeer() {
     if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+    clearVideoSink();
   }
 
   async function connectWHEP() {
-    if (!started) return;
+    if (!started || connectInFlight) return;
+    clearTimeout(reconnectTimer);
+    connectInFlight = true;
     closePeer();
     setStatus('connecting', `Connecting… (${streamName})`);
 
     try {
-      pc = new RTCPeerConnection({
+      const peer = new RTCPeerConnection({
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
         ],
         bundlePolicy: 'max-bundle',
       });
+      pc = peer;
 
       /* Collect all tracks into one MediaStream on the video element */
       const ms = new MediaStream();
-      pc.ontrack = (evt) => {
+      mediaStream = ms;
+      peer.ontrack = (evt) => {
+        if (peer !== pc) return;
         ms.addTrack(evt.track);
         video.srcObject = ms;
         if (evt.track.kind === 'video') {
           video.play().catch((e) => console.warn('video.play():', e));
           setStatus('live', `Live — ${streamName}`);
-          reconnectDelay = 2000;
+          stalledForMs = 0;
+          lastVideoTime = video.currentTime || 0;
         }
       };
 
-      pc.onconnectionstatechange = () => {
-        const s = pc.connectionState;
+      peer.onconnectionstatechange = () => {
+        if (peer !== pc) return;
+        const s = peer.connectionState;
         if (s === 'failed' || s === 'disconnected') {
           setStatus('error', `Connection ${s} — retrying…`);
           showError(`Stream ${s}. Reconnecting…`);
-          scheduleReconnect();
+          closePeer();
+          scheduleReconnect(`connection state ${s}`);
         }
         if (s === 'closed') {
           setStatus('error', 'Connection closed');
         }
       };
 
-      pc.oniceconnectionstatechange = () => {
-        if (pc.iceConnectionState === 'failed') {
-          pc.restartIce();
+      peer.oniceconnectionstatechange = () => {
+        if (peer !== pc) return;
+        if (peer.iceConnectionState === 'failed') {
+          peer.restartIce();
         }
       };
 
+      peer.onicecandidateerror = (e) => {
+        console.warn('ICE candidate error:', e.errorText || e.errorCode || 'unknown');
+      };
+
       /* Receive-only transceivers */
-      pc.addTransceiver('video', { direction: 'recvonly' });
-      pc.addTransceiver('audio', { direction: 'recvonly' });
+      peer.addTransceiver('video', { direction: 'recvonly' });
+      peer.addTransceiver('audio', { direction: 'recvonly' });
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
 
-      /* Wait for ICE gathering (max 3 s) so WHEP receives full candidates */
-      await waitForGathering(pc);
+      /* Keep startup snappy: cap ICE gather wait for faster first frame. */
+      await waitForGathering(peer, iceWaitMs);
 
       const resp = await fetch(whepUrl, {
         method : 'POST',
@@ -456,7 +577,7 @@
           'Content-Type': 'application/sdp',
           'Accept'      : 'application/sdp',
         },
-        body: pc.localDescription.sdp,
+        body: peer.localDescription.sdp,
       });
 
       if (!resp.ok) {
@@ -465,20 +586,23 @@
       }
 
       const answerSdp = await resp.text();
-      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+      await peer.setRemoteDescription({ type: 'answer', sdp: answerSdp });
 
     } catch (err) {
       console.error('WHEP error:', err);
       setStatus('error', `Error: ${err.message.slice(0, 80)}`);
       showError(`Connection failed: ${err.message.slice(0, 100)}`);
-      scheduleReconnect();
+      closePeer();
+      scheduleReconnect(err.message);
+    } finally {
+      connectInFlight = false;
     }
   }
 
-  function waitForGathering(peer) {
+  function waitForGathering(peer, timeoutMs) {
     return new Promise((resolve) => {
       if (peer.iceGatheringState === 'complete') { resolve(); return; }
-      const t = setTimeout(resolve, 3000);
+      const t = setTimeout(resolve, timeoutMs);
       peer.addEventListener('icegatheringstatechange', function handler() {
         if (peer.iceGatheringState === 'complete') {
           clearTimeout(t);
@@ -496,7 +620,55 @@
   function animate(time) {
     requestAnimationFrame(animate);
     if (time - lastGpPoll > 32) { pollGamepad(); lastGpPoll = time; }
+
+    if (devOrientActive) {
+      assistEuler.set(assistPitch, assistYaw, 0, 'YXZ');
+      assistOffsetQ.setFromEuler(assistEuler);
+      camera.quaternion.copy(assistBaseQ).multiply(assistOffsetQ);
+    }
+
     if (video.readyState >= 2) videoTexture.needsUpdate = true;
+
+    /* If frames freeze while connected, force a clean reconnect quickly. */
+    if (time >= nextStallCheckAt) {
+      nextStallCheckAt = time + 500;
+      const looksLive = pc && pc.connectionState === 'connected' && video.readyState >= 2;
+      const currentTime = video.currentTime || 0;
+
+      if (looksLive) {
+        let bufferedLeadSec = 0;
+        try {
+          if (video.buffered && video.buffered.length > 0) {
+            const end = video.buffered.end(video.buffered.length - 1);
+            bufferedLeadSec = Math.max(0, end - currentTime);
+          }
+        } catch (_) {}
+
+        if (bufferedLeadSec > maxBufferSec) {
+          showError('Buffer too deep. Re-syncing live…');
+          closePeer();
+          scheduleReconnect('buffer too deep');
+          stalledForMs = 0;
+          renderer.render(scene, camera);
+          return;
+        }
+
+        if (Math.abs(currentTime - lastVideoTime) < 0.001) stalledForMs += 500;
+        else stalledForMs = 0;
+        lastVideoTime = currentTime;
+
+        if (stalledForMs >= stallMs) {
+          showError('Video stalled. Recovering live…');
+          closePeer();
+          scheduleReconnect('video stalled');
+          stalledForMs = 0;
+        }
+      } else {
+        stalledForMs = 0;
+        lastVideoTime = currentTime;
+      }
+    }
+
     renderer.render(scene, camera);
   }
   requestAnimationFrame(animate);
@@ -523,6 +695,16 @@
   }
 
   document.getElementById('start-btn').addEventListener('click', start);
+
+  window.addEventListener('online', () => {
+    if (started) connectWHEP();
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && started) {
+      connectWHEP();
+    }
+  });
 
   /* Auto-start on non-iOS (Quest / Android don't need the permission dialog) */
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
