@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>360° Live Player</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%; height: 100%; background: #000; color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      overflow: hidden; touch-action: none;
+    }
+
+    #canvas {
+      display: block; position: fixed; inset: 0;
+      width: 100vw; height: 100vh;
+    }
+
+    /* ── Status bar ── */
+    #status-bar {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 20;
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 16px;
+      background: linear-gradient(to bottom, rgba(0,0,0,.8) 0%, transparent 100%);
+      pointer-events: none; user-select: none;
+    }
+    #status-dot {
+      width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0;
+      background: #555;
+    }
+    #status-dot.connecting { background: #f90; animation: blink 1s ease-in-out infinite; }
+    #status-dot.live       { background: #0f0; }
+    #status-dot.error      { background: #f44; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+    #status-text { font-size: 14px; opacity: .9; }
+    #yaw-badge {
+      margin-left: auto; font-size: 12px; opacity: .7;
+      background: rgba(255,255,255,.1); padding: 3px 8px; border-radius: 6px;
+    }
+
+    /* ── Staff controls ── */
+    #controls {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 20;
+      display: flex; align-items: stretch; justify-content: center; gap: 10px;
+      padding: 12px 16px 24px;
+      background: linear-gradient(to top, rgba(0,0,0,.85) 0%, transparent 100%);
+    }
+    .ctrl-btn {
+      flex: 1; max-width: 140px;
+      background: rgba(255,255,255,.13);
+      border: 2px solid rgba(255,255,255,.3);
+      color: #fff; border-radius: 14px;
+      padding: 16px 10px; font-size: 17px; font-weight: 600;
+      cursor: pointer; touch-action: manipulation; user-select: none;
+      line-height: 1.2; text-align: center;
+      transition: background .1s, transform .1s;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .ctrl-btn:active { background: rgba(255,255,255,.3); transform: scale(.97); }
+    #btn-center {
+      flex: 1.4; max-width: 180px;
+      background: rgba(0,120,255,.3);
+      border-color: rgba(80,160,255,.6);
+    }
+    #btn-center:active { background: rgba(0,120,255,.55); }
+    .ctrl-btn small { display: block; font-size: 11px; font-weight: 400; opacity: .65; margin-top: 2px; }
+    #btn-mute {
+      flex: 0 0 56px; max-width: 56px; font-size: 20px; padding: 16px 0;
+    }
+
+    /* ── Start / permission overlay ── */
+    #overlay {
+      position: fixed; inset: 0; z-index: 40;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: rgba(0,0,0,.92); gap: 14px;
+      transition: opacity .4s;
+    }
+    #overlay.hidden { opacity: 0; pointer-events: none; }
+    #overlay h1 { font-size: 26px; font-weight: 700; }
+    #overlay p  { font-size: 15px; color: #aaa; max-width: 320px; text-align: center; line-height: 1.5; }
+    #stream-label { font-size: 13px; color: #6af; word-break: break-all; }
+    #start-btn {
+      margin-top: 8px; padding: 16px 44px; font-size: 20px; font-weight: 700;
+      background: #0070f3; border: none; color: #fff;
+      border-radius: 14px; cursor: pointer; touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #start-btn:active { background: #0055c8; }
+
+    /* ── Error / reconnect overlay ── */
+    #error-overlay {
+      position: fixed; bottom: 100px; left: 50%; transform: translateX(-50%);
+      z-index: 30; background: rgba(200,30,30,.85);
+      border-radius: 12px; padding: 12px 20px;
+      font-size: 14px; text-align: center; max-width: 340px;
+      display: none; pointer-events: none;
+    }
+    #error-overlay.visible { display: block; }
+
+    /* ── Hidden video for WebRTC ── */
+    #video { display: none; }
+  </style>
+</head>
+<body>
+
+<!-- Startup overlay -->
+<div id="overlay">
+  <h1>360° Live Player</h1>
+  <p>Tap <strong>Start</strong> to connect to the live stream and enable orientation tracking.</p>
+  <div id="stream-label"></div>
+  <button id="start-btn">▶ Start</button>
+</div>
+
+<!-- Hidden video element (receives WebRTC track) -->
+<video id="video" autoplay playsinline></video>
+
+<!-- Three.js canvas -->
+<canvas id="canvas"></canvas>
+
+<!-- Status bar -->
+<div id="status-bar">
+  <div id="status-dot" class="connecting"></div>
+  <span id="status-text">Ready</span>
+  <span id="yaw-badge">yaw: 0°</span>
+</div>
+
+<!-- Staff controls -->
+<div id="controls">
+  <button class="ctrl-btn" id="btn-left"   title="Nudge left (←)">◀ Left<small>nudge</small></button>
+  <button class="ctrl-btn" id="btn-center" title="Center / reset yaw (Space)">⊕ Center<small>reset yaw</small></button>
+  <button class="ctrl-btn" id="btn-right"  title="Nudge right (→)">Right ▶<small>nudge</small></button>
+  <button class="ctrl-btn" id="btn-mute"   title="Mute / unmute audio">🔊</button>
+</div>
+
+<!-- Error toast -->
+<div id="error-overlay" role="alert"></div>
+
+<!-- Three.js (global build). Falls back to local copy if CDN is unavailable.
+     To host locally: place three.min.js in the same directory as this file. -->
+<script>
+(function () {
+  function loadScript(src, onok, onfail) {
+    var s = document.createElement('script');
+    s.src = src;
+    s.onload  = onok;
+    s.onerror = onfail;
+    document.head.appendChild(s);
+  }
+  var CDN = 'https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.min.js';
+  var LOCAL = 'three.min.js';
+  loadScript(CDN, function () {}, function () {
+    loadScript(LOCAL, function () {}, function () {
+      document.getElementById('overlay').innerHTML =
+        '<h1 style="color:#f66">Failed to load Three.js</h1>' +
+        '<p>The CDN is unreachable and <code>three.min.js</code> was not found locally.<br>' +
+        'Download it from <a href="https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.min.js" ' +
+        'style="color:#6af">jsDelivr</a> and place it next to this HTML file.</p>';
+    });
+  });
+})();
+</script>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ─────────────────────────────────────────────
+     Config via URL query params
+     ?stream=live          → stream name (default: "live")
+     ?whep=https://…/whep  → full WHEP URL override
+     ?host=https://…       → override base host (default: current origin)
+     ?yaw=0                → initial yaw offset in degrees (default: 0 or localStorage)
+     ?nudge=15             → degrees per nudge button press (default: 15)
+  ───────────────────────────────────────────── */
+  const params     = new URLSearchParams(location.search);
+  const streamName = params.get('stream') || 'live';
+  const baseHost   = (params.get('host') || location.origin).replace(/\/$/, '');
+  const whepUrl    = params.get('whep')  || `${baseHost}/${streamName}/whep`;
+  const nudgeDeg   = parseFloat(params.get('nudge') || '15');
+  const initialYaw = parseFloat(params.get('yaw')   || '0');
+
+  const LS_KEY = `360player_yaw_${streamName}`;
+  let yawOffset = parseFloat(localStorage.getItem(LS_KEY) ?? initialYaw);
+
+  /* ── Populate overlay ── */
+  document.getElementById('stream-label').textContent = whepUrl;
+
+  /* ─────────────────────────────────────────────
+     Three.js scene
+  ───────────────────────────────────────────── */
+  const canvas   = document.getElementById('canvas');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+
+  const scene  = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(
+    90, window.innerWidth / window.innerHeight, 0.1, 2000
+  );
+  camera.position.set(0, 0, 0);
+
+  /* Inside-out sphere */
+  const sphereGeo = new THREE.SphereGeometry(500, 72, 40);
+  sphereGeo.scale(-1, 1, 1);
+
+  const video        = document.getElementById('video');
+  const videoTexture = new THREE.VideoTexture(video);
+  try { videoTexture.colorSpace = THREE.SRGBColorSpace; } catch (_) {}
+
+  const sphereMat  = new THREE.MeshBasicMaterial({ map: videoTexture });
+  const sphere     = new THREE.Mesh(sphereGeo, sphereMat);
+  scene.add(sphere);
+
+  /* Resize */
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  /* ─────────────────────────────────────────────
+     Yaw management (staff sphere offset)
+  ───────────────────────────────────────────── */
+  function saveYaw()  { localStorage.setItem(LS_KEY, yawOffset); }
+  function applyYaw() {
+    sphere.rotation.y = THREE.MathUtils.degToRad(yawOffset);
+    document.getElementById('yaw-badge').textContent =
+      `yaw: ${Math.round(yawOffset)}°`;
+  }
+  applyYaw();
+
+  function nudgeLeft()  { yawOffset -= nudgeDeg; saveYaw(); applyYaw(); flash('btn-left');  }
+  function nudgeRight() { yawOffset += nudgeDeg; saveYaw(); applyYaw(); flash('btn-right'); }
+  function centerYaw()  {
+    yawOffset = initialYaw;
+    saveYaw(); applyYaw(); flash('btn-center');
+  }
+
+  function flash(id) {
+    const el = document.getElementById(id);
+    el.classList.add('active');
+    setTimeout(() => el.classList.remove('active'), 150);
+  }
+
+  document.getElementById('btn-left')  .addEventListener('click', nudgeLeft);
+  document.getElementById('btn-right') .addEventListener('click', nudgeRight);
+  document.getElementById('btn-center').addEventListener('click', centerYaw);
+
+  /* Keyboard shortcuts */
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft'  || e.key === 'a' || e.key === 'A') nudgeLeft();
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') nudgeRight();
+    if (e.key === ' ' || e.key === 'c' || e.key === 'C') { e.preventDefault(); centerYaw(); }
+  });
+
+  /* ─────────────────────────────────────────────
+     Camera orientation — device + mouse/touch
+  ───────────────────────────────────────────── */
+  let devOrientActive = false;
+
+  /* Classic Three.js device-orientation quaternion math */
+  const _zee   = new THREE.Vector3(0, 0, 1);
+  const _q1    = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2); // -90° around X
+  const _euler = new THREE.Euler();
+
+  function onDeviceOrientation(evt) {
+    if (evt.alpha === null && evt.beta === null && evt.gamma === null) return;
+    devOrientActive = true;
+
+    const alpha  = THREE.MathUtils.degToRad(evt.alpha  || 0);
+    const beta   = THREE.MathUtils.degToRad(evt.beta   || 0);
+    const gamma  = THREE.MathUtils.degToRad(evt.gamma  || 0);
+    const orient = THREE.MathUtils.degToRad(window.screen?.orientation?.angle || 0);
+
+    _euler.set(beta, alpha, -gamma, 'YXZ');
+    const q = new THREE.Quaternion().setFromEuler(_euler);
+    q.multiply(_q1);
+    q.multiply(new THREE.Quaternion().setFromAxisAngle(_zee, -orient));
+    camera.quaternion.copy(q);
+  }
+  window.addEventListener('deviceorientation', onDeviceOrientation);
+
+  /* Mouse / touch drag (fallback when no device orientation) */
+  let isDragging = false, dragX = 0, dragY = 0;
+  let camYaw = 0, camPitch = 0;
+
+  function startDrag(x, y) { isDragging = true; dragX = x; dragY = y; }
+  function moveDrag(x, y) {
+    if (!isDragging || devOrientActive) return;
+    camYaw   -= (x - dragX) * 0.003;
+    camPitch -= (y - dragY) * 0.003;
+    camPitch  = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, camPitch));
+    dragX = x; dragY = y;
+    camera.rotation.set(camPitch, camYaw, 0, 'YXZ');
+  }
+  function endDrag() { isDragging = false; }
+
+  canvas.addEventListener('mousedown',  (e) => startDrag(e.clientX, e.clientY));
+  window.addEventListener('mousemove',  (e) => moveDrag(e.clientX, e.clientY));
+  window.addEventListener('mouseup',    endDrag);
+  canvas.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) startDrag(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: true });
+  canvas.addEventListener('touchmove',  (e) => {
+    if (e.touches.length === 1) moveDrag(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: true });
+  canvas.addEventListener('touchend', endDrag, { passive: true });
+
+  /* ─────────────────────────────────────────────
+     Gamepad / controller support
+     Left stick X → continuous yaw
+     Right stick X → continuous yaw
+     Button 0 (A/Cross)   → center
+     Button 2 (X/Square)  → nudge left
+     Button 1 (B/Circle)  → nudge right
+  ───────────────────────────────────────────── */
+  const gpState = {};  // track button state for edge detection
+
+  function pollGamepad() {
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (let i = 0; i < pads.length; i++) {
+      const pad = pads[i];
+      if (!pad) continue;
+      if (!gpState[i]) gpState[i] = {};
+
+      /* Stick axes — threshold 0.2 */
+      const axisL = pad.axes[0] || 0;
+      const axisR = pad.axes[2] || 0;
+      const stick = Math.abs(axisL) > 0.2 ? axisL : (Math.abs(axisR) > 0.2 ? axisR : 0);
+      if (stick !== 0) {
+        yawOffset += stick * 0.4;
+        saveYaw(); applyYaw();
+      }
+
+      /* Edge-triggered buttons */
+      function btn(idx, fn) {
+        const pressed = pad.buttons[idx]?.pressed || false;
+        if (pressed && !gpState[i][idx]) fn();
+        gpState[i][idx] = pressed;
+      }
+      btn(0, centerYaw);
+      btn(2, nudgeLeft);
+      btn(1, nudgeRight);
+    }
+  }
+
+  /* ─────────────────────────────────────────────
+     Audio mute toggle
+  ───────────────────────────────────────────── */
+  let muted = false;
+  const muteBtn = document.getElementById('btn-mute');
+  muteBtn.addEventListener('click', () => {
+    muted = !muted;
+    video.muted = muted;
+    muteBtn.textContent = muted ? '🔇' : '🔊';
+  });
+
+  /* ─────────────────────────────────────────────
+     Status / error helpers
+  ───────────────────────────────────────────── */
+  function setStatus(state, msg) {
+    document.getElementById('status-dot').className  = state;
+    document.getElementById('status-text').textContent = msg;
+  }
+
+  let errorTimer = null;
+  function showError(msg) {
+    const el = document.getElementById('error-overlay');
+    el.textContent = msg;
+    el.classList.add('visible');
+    clearTimeout(errorTimer);
+    errorTimer = setTimeout(() => el.classList.remove('visible'), 6000);
+  }
+
+  /* ─────────────────────────────────────────────
+     WHEP client
+  ───────────────────────────────────────────── */
+  let pc               = null;
+  let reconnectDelay   = 2000;
+  let reconnectTimer   = null;
+  let started          = false;
+
+  function scheduleReconnect() {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      connectWHEP();
+    }, reconnectDelay);
+  }
+
+  function closePeer() {
+    if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+  }
+
+  async function connectWHEP() {
+    if (!started) return;
+    closePeer();
+    setStatus('connecting', `Connecting… (${streamName})`);
+
+    try {
+      pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+        ],
+        bundlePolicy: 'max-bundle',
+      });
+
+      /* Collect all tracks into one MediaStream on the video element */
+      const ms = new MediaStream();
+      pc.ontrack = (evt) => {
+        ms.addTrack(evt.track);
+        video.srcObject = ms;
+        if (evt.track.kind === 'video') {
+          video.play().catch((e) => console.warn('video.play():', e));
+          setStatus('live', `Live — ${streamName}`);
+          reconnectDelay = 2000;
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        const s = pc.connectionState;
+        if (s === 'failed' || s === 'disconnected') {
+          setStatus('error', `Connection ${s} — retrying…`);
+          showError(`Stream ${s}. Reconnecting…`);
+          scheduleReconnect();
+        }
+        if (s === 'closed') {
+          setStatus('error', 'Connection closed');
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === 'failed') {
+          pc.restartIce();
+        }
+      };
+
+      /* Receive-only transceivers */
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      /* Wait for ICE gathering (max 3 s) so WHEP receives full candidates */
+      await waitForGathering(pc);
+
+      const resp = await fetch(whepUrl, {
+        method : 'POST',
+        headers: {
+          'Content-Type': 'application/sdp',
+          'Accept'      : 'application/sdp',
+        },
+        body: pc.localDescription.sdp,
+      });
+
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} ${resp.statusText}: ${body.slice(0, 120)}`);
+      }
+
+      const answerSdp = await resp.text();
+      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+    } catch (err) {
+      console.error('WHEP error:', err);
+      setStatus('error', `Error: ${err.message.slice(0, 80)}`);
+      showError(`Connection failed: ${err.message.slice(0, 100)}`);
+      scheduleReconnect();
+    }
+  }
+
+  function waitForGathering(peer) {
+    return new Promise((resolve) => {
+      if (peer.iceGatheringState === 'complete') { resolve(); return; }
+      const t = setTimeout(resolve, 3000);
+      peer.addEventListener('icegatheringstatechange', function handler() {
+        if (peer.iceGatheringState === 'complete') {
+          clearTimeout(t);
+          peer.removeEventListener('icegatheringstatechange', handler);
+          resolve();
+        }
+      });
+    });
+  }
+
+  /* ─────────────────────────────────────────────
+     Render loop
+  ───────────────────────────────────────────── */
+  let lastGpPoll = 0;
+  function animate(time) {
+    requestAnimationFrame(animate);
+    if (time - lastGpPoll > 32) { pollGamepad(); lastGpPoll = time; }
+    if (video.readyState >= 2) videoTexture.needsUpdate = true;
+    renderer.render(scene, camera);
+  }
+  requestAnimationFrame(animate);
+
+  /* ─────────────────────────────────────────────
+     Start button — unlocks autoplay + orientation
+  ───────────────────────────────────────────── */
+  async function start() {
+    document.getElementById('overlay').classList.add('hidden');
+    started = true;
+
+    /* iOS 13+ device orientation permission */
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        const result = await DeviceOrientationEvent.requestPermission();
+        if (result !== 'granted') console.warn('Orientation permission denied');
+      } catch (e) {
+        console.warn('Orientation permission error:', e);
+      }
+    }
+
+    connectWHEP();
+  }
+
+  document.getElementById('start-btn').addEventListener('click', start);
+
+  /* Auto-start on non-iOS (Quest / Android don't need the permission dialog) */
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+  if (!isIOS) start();
+
+})();
+</script>
+</body>
+</html>
